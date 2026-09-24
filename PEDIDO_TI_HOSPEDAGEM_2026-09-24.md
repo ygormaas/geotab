@@ -111,8 +111,8 @@ de 4.500 a cada 60 s). Sugerimos tratar a primeira semana como período de obser
 
 | | |
 |---|---|
-| **URL** | `https://github.com/centraldeinteligenciamaas/geotab` |
-| **Organização** | `centraldeinteligenciamaas` (GitHub, privado) |
+| **URL** | `https://github.com/ygormaas/geotab` |
+| **Conta** | `ygormaas` (GitHub, repositório privado) |
 | **Branch principal** | `main` — 76 commits |
 | **Linguagem** | Python (hoje rodando em 3.14; compatível com 3.12+) |
 | **Tamanho** | ~11.700 linhas entre Python e SQL, 37 arquivos versionados |
