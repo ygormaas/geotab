@@ -43,26 +43,58 @@ GEOTAB = {
     "password": os.environ["GEOTAB_PASSWORD"],
 }
 
+# Destino da gravacao (migracao 2026-09-22):
+#   "local" (DEFAULT) -> chaves SUPABASE_*  = Postgres da maquina. E a PRODUCAO.
+#   "cloud"           -> chaves GCP_*       = Cloud SQL, schema geotab do banco maas_man.
+# O ensaio da migracao roda com GEOTAB_DESTINO=cloud e NAO toca nas chaves de producao.
+# A tarefa agendada nao define a variavel, entao continua caindo em "local".
+DESTINO = os.environ.get("GEOTAB_DESTINO", "local").strip().lower()
+if DESTINO not in ("local", "cloud"):
+    raise SystemExit(f"GEOTAB_DESTINO invalido: {DESTINO!r}. Use 'local' ou 'cloud'.")
+_PFX = "GCP_" if DESTINO == "cloud" else "SUPABASE_"
+
 SUPABASE = {
-    "host":    os.environ["SUPABASE_HOST"],
-    "porta":   int(os.environ.get("SUPABASE_PORTA", 5432)),
-    "banco":   os.environ["SUPABASE_BANCO"],
-    "usuario": os.environ["SUPABASE_USUARIO"],
-    "senha":   os.environ["SUPABASE_SENHA"],
-    # require: nuvem (Supabase exige SSL). disable: Postgres local sem SSL.
-    "sslmode": os.environ.get("SUPABASE_SSLMODE", "require"),
+    "host":    os.environ[f"{_PFX}HOST"],
+    "porta":   int(os.environ.get(f"{_PFX}PORTA", 5432)),
+    "banco":   os.environ[f"{_PFX}BANCO"],
+    "usuario": os.environ[f"{_PFX}USUARIO"],
+    "senha":   os.environ[f"{_PFX}SENHA"],
+    # require: nuvem (Cloud SQL exige SSL). disable: Postgres local sem SSL.
+    "sslmode": os.environ.get(f"{_PFX}SSLMODE", "require"),
+    # Schema alvo. Vazio = search_path padrao do banco (Postgres local: public).
+    # No Cloud SQL as tabelas moram no schema "geotab" dentro do banco maas_man.
+    "schema":  os.environ.get(f"{_PFX}SCHEMA", "").strip(),
 }
 
 # GPS: acumulado pelo device Geotab desde a instalação — sempre em metros.
 DIAG_GPS = "DiagnosticDeviceTotalDistanceId"
 
 # Odômetro físico via OBD2 — testados em ordem de prioridade.
-# Unidade inferida automaticamente: > 1_000_000 → metros (÷1000); caso contrário → km.
+# A UNIDADE É PROPRIEDADE DO DIAGNÓSTICO, não do valor (corrigido 2026-09-22).
+# Antes havia um palpite por leitura (`> 1_000_000 → metros`) que errava em todo
+# veículo com menos de 1.000 km — ver _inferir_km. E como o diagnóstico é
+# ESCOLHIDO EM TEMPO DE EXECUÇÃO (_selecionar_diag_fisico pega o 1º com dado),
+# um palpite global também quebraria se a escolha mudasse: o 1º candidato já
+# entrega km pelo próprio nome.
+#
+# Sondado nesta base em 2026-09-22 (set/26, 20 devices):
+#   DiagnosticOdometerInKilometersId → 0 leituras (VAZIO nesta base)
+#   DiagnosticOdometerAdjustmentId   → 219 leituras, 9.456.000 a 190.527.798
+#                                      (= 9.456 a 190.527 km → metros)
+#   DiagnosticOdometer               → 0 leituras
 DIAG_ODO_FISICO = [
     "DiagnosticOdometerInKilometersId",
     "DiagnosticOdometerAdjustmentId",
     "DiagnosticOdometer",
 ]
+
+# Divisor por diagnóstico p/ chegar em km. Default (diag desconhecido) = 1000,
+# que é o caso dos dois diagnósticos em metros.
+DIVISOR_ODO_KM = {
+    "DiagnosticOdometerInKilometersId": 1,      # já vem em km (pelo nome)
+    "DiagnosticOdometerAdjustmentId":   1000,   # metros — confirmado por sondagem
+    "DiagnosticOdometer":               1000,   # metros
+}
 
 # Devices por lote nas consultas de StatusData (odômetro). Cada device pode ter
 # milhares de leituras em 30 dias; lote menor = menos leituras seguradas por vez
@@ -80,6 +112,23 @@ ODO_INCREMENTAL_DIAS = int(os.environ.get("GEOTAB_ODO_INCREMENTAL_DIAS", 7))
 # Bump ANO_CORTE (ou a env) para virar o ano.
 ANO_CORTE  = int(os.environ.get("ANO_CORTE", 2026))
 DATA_CORTE = datetime(ANO_CORTE, 1, 1)
+
+# Piso PRÓPRIO do ODÔMETRO (2026-09-22). O usuário quer hodômetro de 2025 sem
+# arrastar comportamento/viagens/resumo junto — baixar ANO_CORTE faria tb_viagens
+# (204 MB só de 2026) quase dobrar, desfazendo o enxugamento de 2026-06-15.
+# Então o odômetro ganhou uma janela independente: só tb_odometro_dia e
+# tb_odometro_mensal a enxergam; DATA_CORTE segue mandando em todo o resto.
+#
+# Default = DATA_CORTE → sem a env, NADA muda no comportamento do projeto.
+# Env ODO_DATA_INICIO = 'AAAA-MM-DD'.
+#
+# Limite REAL da origem (sondado em 2026-09-22 com 8 devices, mês a mês):
+#   jan/25, fev/25, mar/25 → 0 leituras
+#   15/abr/2025            → primeira leitura que existe (3 devices)
+#   jun/25 em diante       → 5 devices, volume estável
+# Ou seja, a Geotab retém ~17 meses. Pedir antes de 2025-04-15 devolve vazio.
+_odo_ini = os.environ.get("ODO_DATA_INICIO", "").strip()
+ODO_DATA_CORTE = datetime.strptime(_odo_ini, "%Y-%m-%d") if _odo_ini else DATA_CORTE
 
 
 # ─────────────────────────────────────────────────────────
@@ -113,10 +162,15 @@ def criar_engine():
     # de servidor). Evita o "max clients reached in session mode" que estourava o
     # limite de 15 do session mode (porta 5432), onde cada conexão segura um slot.
     # Os syncs rodam sequencialmente (lock no app.py) — não há concorrência real.
+    conectar = {"connect_timeout": 30}
+    if cfg["schema"]:
+        # -c search_path=<schema>: todo CREATE TABLE/VIEW e to_sql SEM qualificacao
+        # cai neste schema. Mantem o script e o views.sql livres de prefixo.
+        conectar["options"] = f"-c search_path={cfg['schema']}"
     return create_engine(
         url,
         poolclass=NullPool,
-        connect_args={"connect_timeout": 30},
+        connect_args=conectar,
     )
 
 
@@ -168,6 +222,7 @@ def criar_tabelas(engine):
             motorista_tel    TEXT,
             motorista_matricula TEXT,
             viagem_inicio    TIMESTAMP,
+            viagem_fim       TIMESTAMP,
             snapshot_em      TIMESTAMP
         );
 
@@ -275,6 +330,65 @@ def criar_tabelas(engine):
         );
         CREATE INDEX IF NOT EXISTS ix_odo_dia_dia ON tb_odometro_dia (dia);
 
+        -- Odometro por VEICULO x MES (2026-09-22). DERIVADA de tb_odometro_dia
+        -- + tb_cadastro: recalculada por inteiro (TRUNCATE+INSERT) no fim do modo
+        -- `comportamento`, por `recarregar_odometro_mensal`. Cobre a frota TODA
+        -- (sem filtro de cliente); p/ recortar por cliente no painel use
+        -- `todos_grupos_expandido` (o token OPE_<cliente> nao esta na folha).
+        CREATE TABLE IF NOT EXISTS tb_odometro_mensal (
+            device_id        TEXT,
+            ano              INTEGER,
+            mes              INTEGER,
+            ano_mes          TEXT,
+            mes_ini          DATE,
+            mes_fim          DATE,
+            serial           TEXT,
+            placa            TEXT,
+            veiculo          TEXT,
+            todos_grupos     TEXT,
+            todos_grupos_expandido TEXT,
+            grupo_id         INTEGER,
+            odometro_inicio  DOUBLE PRECISION,
+            odometro_fim     DOUBLE PRECISION,
+            km_periodo       NUMERIC,
+            dia_inicio       DATE,
+            dia_fim          DATE,
+            dias_com_leitura INTEGER,
+            origem_inicio    TEXT,
+            origem_dado      TEXT,
+            atualizado_em    TIMESTAMP,
+            PRIMARY KEY (device_id, ano, mes)
+        );
+        CREATE INDEX IF NOT EXISTS ix_odo_mensal_ano_mes ON tb_odometro_mensal (ano_mes);
+        CREATE INDEX IF NOT EXISTS ix_odo_mensal_placa   ON tb_odometro_mensal (placa);
+        CREATE INDEX IF NOT EXISTS ix_odo_mensal_device  ON tb_odometro_mensal (device_id);
+
+        -- ABASTECIMENTOS (entidade FuelUpEvent da Geotab) — 2026-08-31.
+        -- A Geotab DEDUZ cada abastecimento pela subida do nível do tanque + parada
+        -- de viagem; NÃO é dado contábil (a entidade FuelTransaction, que traria R$,
+        -- posto e nota, está VAZIA nesta base — sem integração de cartão).
+        -- A API não devolve `id` p/ o evento → PK é (device_id, data_hora).
+        -- Enxuta como tb_viagens: placa/grupo/motorista_nome vêm por JOIN nas views
+        -- (tb_cadastro por device_id, tb_motoristas por motorista_id).
+        CREATE TABLE IF NOT EXISTS tb_abastecimento (
+            device_id        TEXT,
+            data_hora        TIMESTAMP,
+            litros           DOUBLE PRECISION,  -- volume (11% vêm 0: use litros_derivado)
+            litros_derivado  DOUBLE PRECISION,  -- derivedVolume: recálculo da Geotab
+            litros_motor     DOUBLE PRECISION,  -- totalFuelUsed pelo motor desde o anterior
+            distancia_km     DOUBLE PRECISION,  -- distance rodada desde o abast. anterior
+            odometro_km      DOUBLE PRECISION,  -- odometer no momento do abastecimento
+            tanque_litros    DOUBLE PRECISION,  -- tankCapacity: ESTIMADO pela Geotab
+            latitude         DOUBLE PRECISION,
+            longitude        DOUBLE PRECISION,
+            motorista_id     TEXT,              -- ~54% identificado
+            tipo_combustivel TEXT,              -- productType (hoje 100% 'Unknown')
+            confianca        TEXT,              -- confidence da detecção
+            atualizado_em    TIMESTAMP,
+            PRIMARY KEY (device_id, data_hora)
+        );
+        CREATE INDEX IF NOT EXISTS ix_abast_data ON tb_abastecimento (data_hora);
+
         -- Dimensão de MOTORISTAS (entidade User da Geotab). lotacao = grupo ULOT_
         -- (unidade de lotação) do motorista; todos_grupos = cadeia SUP_|REG_|ULOT_.
         -- Usada pela vw_motoristas (JOIN por id = motorista_id de tb_viagens).
@@ -289,6 +403,11 @@ def criar_tabelas(engine):
             todos_grupos   TEXT,
             atualizado_em  TIMESTAMP
         );
+
+        -- viagem_fim nasceu em script de migracao avulso e nunca entrou no
+        -- criar_tabelas() -- instalacao nova ficava sem a coluna e o views.sql
+        -- quebrava (vw_saneago_status a usa). Corrigido em 2026-09-22.
+        ALTER TABLE tb_status ADD COLUMN IF NOT EXISTS viagem_fim TIMESTAMP;
     """
     # Migra colunas existentes de TIMESTAMPTZ → TIMESTAMP (converte UTC → BRT)
     migrar = """
@@ -355,6 +474,15 @@ def criar_tabelas(engine):
         -- `nome` guarda o login/e-mail (User.name); este traz o nome de pessoa.
         ALTER TABLE tb_motoristas
             ADD COLUMN IF NOT EXISTS nome_completo TEXT;
+        -- Grupos ANCESTRAIS (folha + todos os pais) p/ o filtro por HIERARQUIA do
+        -- SEMAD — 2026-09-14. A frota do SEMAD passou a ficar em subgrupos por
+        -- secretaria (SMS, SET, AMMA...) sob o grupo-pai do contrato
+        -- (SEMAD - NNN/2026); o `todos_grupos` (só grupos DIRETOS/folha) não carrega
+        -- mais o número do contrato. Coluna SEPARADA de propósito: NÃO toca
+        -- `todos_grupos`/`grupo_id` (compartilhados com a SANEAGO). Só as views
+        -- vw_semad_cadastro/vw_semad_grupos a consomem.
+        ALTER TABLE tb_cadastro
+            ADD COLUMN IF NOT EXISTS todos_grupos_expandido TEXT;
     """
     def _executar():
         with engine.begin() as conn:
@@ -367,9 +495,14 @@ def criar_tabelas(engine):
 
 
 def gravar_tabela(df, nome_tabela, engine, chave_upsert="id"):
+    """Upsert de um DataFrame na tabela. `chave_upsert` aceita uma coluna ("id") ou
+    uma chave COMPOSTA separada por vírgula ("device_id, data_hora") — necessário
+    para tb_abastecimento, cuja entidade da Geotab não devolve um `id` próprio."""
     if df.empty:
         log.warning(f"DataFrame vazio — {nome_tabela} não atualizada.")
         return
+
+    cols_chave = [c.strip() for c in chave_upsert.split(",")]
 
     def _executar():
         with engine.begin() as conn:
@@ -382,7 +515,7 @@ def gravar_tabela(df, nome_tabela, engine, chave_upsert="id"):
             cols_str   = ", ".join(colunas)
             update_str = ", ".join([
                 f"{c} = EXCLUDED.{c}"
-                for c in colunas if c != chave_upsert
+                for c in colunas if c not in cols_chave
             ])
 
             conn.execute(text(f"""
@@ -419,6 +552,39 @@ def _mapa_todos_grupos(credentials, veiculos):
         gnomes = [grupos.get(g.get("id"), g.get("id")) for g in v.get("groups", [])]
         mapa[v.get("id")] = " | ".join(gnomes)
     return mapa
+
+
+def _indice_grupos(grupos_raw):
+    """De uma lista de entidades Group da Geotab, retorna (id2name, parents):
+    - id2name[gid] = nome do grupo
+    - parents[gid] = set de ids-PAI (invertido do campo children[] de cada grupo)
+    Um grupo pode ter mais de um pai (ex.: SET é filho de SEMAD-035 e SEMAD-031)."""
+    id2name = {g.get("id"): g.get("name", "") for g in grupos_raw}
+    parents = {}
+    for g in grupos_raw:
+        pid = g.get("id")
+        for ch in (g.get("children") or []):
+            cid = ch.get("id") if isinstance(ch, dict) else ch
+            if cid:
+                parents.setdefault(cid, set()).add(pid)
+    return id2name, parents
+
+
+def _grupos_com_ancestrais(gids, parents):
+    """Conjunto de ids = os próprios `gids` + TODOS os ancestrais (subindo por
+    parents[]). Usado p/ montar `todos_grupos_expandido`, que o filtro do SEMAD
+    consulta — a frota do contrato fica em subgrupos por secretaria e só o
+    grupo-pai (SEMAD - NNN/2026) identifica o contrato."""
+    vistos, pilha = set(), list(gids)
+    while pilha:
+        gid = pilha.pop()
+        if gid in vistos:
+            continue
+        vistos.add(gid)
+        for pid in parents.get(gid, ()):
+            if pid not in vistos:
+                pilha.append(pid)
+    return vistos
 
 
 def parse_nome_veiculo(nome: str) -> dict:
@@ -693,20 +859,26 @@ def extrair_cadastro(credentials):
             "Geotab retornou 0 devices — provável falha de API (WAF/quota), não "
             "frota vazia. Abortando o cadastro para o erro aparecer em /status."
         )
-    grupos   = {
-        g.get("id"): g.get("name", "")
-        for g in geotab_get(credentials, "Group")
-    }
+    grupos_raw       = geotab_get(credentials, "Group")
+    grupos, parents  = _indice_grupos(grupos_raw)
     rows = []
     for v in veiculos:
         gids   = [g.get("id") for g in v.get("groups", [])]
         gnomes = [grupos.get(gid, gid) for gid in gids]
-        nome   = v.get("name", "")
+        # Expandido = folhas + TODOS os ancestrais (nomes, únicos, ordenados).
+        # Só o filtro do SEMAD usa isto; NÃO altera `todos_grupos` (SANEAGO/grupo_id).
+        exp_ids   = _grupos_com_ancestrais(gids, parents)
+        exp_nomes = " | ".join(sorted({grupos.get(gid, gid) for gid in exp_ids}))
+        # .strip(): a Geotab devolve name/licensePlate com espaco nas bordas em
+        # parte da frota (207 placas em 2026-09-24). Isso NAO quebra JOIN -- eles sao
+        # por device_id -- mas no Power BI "ABC1D23" e "ABC1D23 " viram valores
+        # DISTINTOS: duplicam no filtro e quebram relacionamento por placa.
+        nome   = (v.get("name") or "").strip()
         parsed = parse_nome_veiculo(nome)
         rows.append({
             "id":            v.get("id", ""),
             "serial":        v.get("serialNumber", ""),
-            "placa":         v.get("licensePlate", ""),
+            "placa":         (v.get("licensePlate") or "").strip(),
             "veiculo":       nome,
             # Geotab não preenche make/model/year — extraímos do nome
             "marca":         v.get("make", "") or parsed["marca"],
@@ -716,6 +888,7 @@ def extrair_cadastro(credentials):
             # gnomes[-1] = grupo mais específico (gnomes[0] seria "Vehicle", raiz)
             "grupo":         gnomes[-1] if gnomes else "",
             "todos_grupos":  " | ".join(gnomes),
+            "todos_grupos_expandido": exp_nomes,
             "ativo":         not v.get("isArchived", False),
             "atualizado_em": agora_brt(),
         })
@@ -773,7 +946,7 @@ def extrair_status(credentials):
     veiculos   = geotab_get(credentials, "Device")
     lista_ids  = [v.get("id") for v in veiculos]
     serial_map = {v.get("id"): v.get("serialNumber", "") for v in veiculos}
-    placa_map  = {v.get("id"): v.get("licensePlate", "") for v in veiculos}
+    placa_map  = {v.get("id"): (v.get("licensePlate") or "").strip() for v in veiculos}
     grupos_map = _mapa_todos_grupos(credentials, veiculos)
 
     status_map = {}
@@ -868,13 +1041,35 @@ def extrair_status(credentials):
 # ─────────────────────────────────────────────────────────
 # ODÔMETRO — GPS e físico (OBD2)
 # ─────────────────────────────────────────────────────────
-def _inferir_km(valor_raw: float) -> float:
-    """Detecta a unidade do valor bruto e retorna km.
-    Regra: valores > 1_000_000 estão em metros (÷ 1000); abaixo disso já são km.
-    Cobertura: 1.000 km em metros = 1.000.000 → limiar justo para frotas comerciais."""
+def _inferir_km(valor_raw: float, diag_id: str | None = None) -> float:
+    """Converte o odômetro bruto em km usando o divisor DO DIAGNÓSTICO.
+
+    CORRIGIDO 2026-09-22. A versão anterior decidia a unidade POR LEITURA
+    (`raw > 1_000_000 → ÷1000, senão mantém`), assumindo que valores pequenos já
+    viessem em km. Não vêm: o diagnóstico em uso nesta base
+    (DiagnosticOdometerAdjustmentId) manda metros SEMPRE, então todo veículo com
+    odômetro abaixo de 1.000 km (= 1.000.000 m) ficava gravado em metros como se
+    fosse km — 1000× maior.
+
+    Medido antes de corrigir (set/2026, odômetro vs km de tb_viagens):
+      • 1.656 devices com razão ≈ 1     → raw > 1e6, eram divididos (certos)
+      •    57 devices com razão ≈ 1000  → raw < 1e6, NÃO eram divididos (errados),
+        todos com odômetro entre 154.000 e 995.700, ou seja, sob o limiar
+      •    69 devices com uma queda de ~1000× na série, sempre com o valor
+        anterior entre 908.000 e 1.000.000 — o dia em que cruzaram o limiar
+
+    Essa era a causa raiz das 439 leituras "não monotônicas" de tb_odometro_dia
+    e dos km_periodo negativos em tb_odometro_mensal.
+
+    O divisor vem de DIVISOR_ODO_KM e NÃO é fixo em 1000 de propósito: o
+    diagnóstico é escolhido em tempo de execução por _selecionar_diag_fisico, e
+    o 1º candidato (DiagnosticOdometerInKilometersId) já entrega km. Hoje ele
+    está vazio nesta base, mas se passar a responder, um ÷1000 fixo deixaria
+    todo o hodômetro 1000× MENOR."""
     if not valor_raw:
         return 0.0
-    return round(valor_raw / 1000, 2) if valor_raw > 1_000_000 else round(float(valor_raw), 2)
+    div = DIVISOR_ODO_KM.get(diag_id, 1000)
+    return round(float(valor_raw) / div, 2)
 
 
 def _max_diag_em_lotes(credentials, lista_ids, diag_id, ini, fim, lote=ODO_LOTE):
@@ -974,8 +1169,8 @@ def sincronizar_odometro_dia(credentials, engine, lista_ids, data_inicio, data_f
     device por dia, na janela [data_inicio, data_fim]. Upsert por (device, dia):
     re-execução de um dia atualiza o valor. Substitui o odômetro que vivia em
     tb_comportamento — agora consultável por dia e exposto na vw_comportamento."""
-    if data_inicio < DATA_CORTE:   # piso global: somente 2026+
-        data_inicio = DATA_CORTE
+    if data_inicio < ODO_DATA_CORTE:   # piso PRÓPRIO do odômetro (não o global)
+        data_inicio = ODO_DATA_CORTE
     log.info(f"Odômetro/dia: {data_inicio:%Y-%m-%d} → {data_fim:%Y-%m-%d}")
 
     gps_raw = _odo_por_dia_em_lotes(credentials, lista_ids, DIAG_GPS, data_inicio, data_fim)
@@ -988,7 +1183,7 @@ def sincronizar_odometro_dia(credentials, engine, lista_ids, data_inicio, data_f
     for (did, dia), v in gps_raw.items():
         linhas.setdefault((did, dia), {"odometro": 0.0, "odometro_gps": 0.0})["odometro_gps"] = round(v / 1000, 2)
     for (did, dia), v in fis_raw.items():
-        linhas.setdefault((did, dia), {"odometro": 0.0, "odometro_gps": 0.0})["odometro"] = _inferir_km(v)
+        linhas.setdefault((did, dia), {"odometro": 0.0, "odometro_gps": 0.0})["odometro"] = _inferir_km(v, diag_fis)
 
     if not linhas:
         log.info("  • Odômetro/dia: nada a gravar.")
@@ -1015,16 +1210,109 @@ def sincronizar_odometro_dia(credentials, engine, lista_ids, data_inicio, data_f
     _com_retry(_exec)
     log.info(f"  ✓ tb_odometro_dia: {len(df)} linhas (device×dia) gravadas.")
 
-    # Piso global: remove qualquer odômetro de antes de 2026 (ex.: vazamento de fuso).
+    # Piso do ODÔMETRO (ODO_DATA_CORTE, não o global): remove o que ficou antes
+    # da janela pedida — ex.: vazamento de fuso. Se a env ODO_DATA_INICIO não
+    # estiver setada, ODO_DATA_CORTE == DATA_CORTE e a regra é a de sempre.
     def _poda_corte():
         with engine.begin() as conn:
             return conn.execute(
                 text("DELETE FROM tb_odometro_dia WHERE dia < :corte"),
-                {"corte": DATA_CORTE.date()},
+                {"corte": ODO_DATA_CORTE.date()},
             ).rowcount
     n = _com_retry(_poda_corte)
     if n:
-        log.info(f"  ✓ odômetro/dia: {n} linhas < {ANO_CORTE} removidas (piso).")
+        log.info(f"  ✓ odômetro/dia: {n} linhas < {ODO_DATA_CORTE:%Y-%m-%d} removidas (piso).")
+
+
+SQL_ODOMETRO_MENSAL = """
+INSERT INTO tb_odometro_mensal (
+    device_id, ano, mes, ano_mes, mes_ini, mes_fim,
+    serial, placa, veiculo, todos_grupos, todos_grupos_expandido, grupo_id,
+    odometro_inicio, odometro_fim, km_periodo,
+    dia_inicio, dia_fim, dias_com_leitura, origem_inicio, origem_dado, atualizado_em)
+WITH meses AS (
+    SELECT d::date AS mes_ini,
+           (d + INTERVAL '1 month' - INTERVAL '1 day')::date AS mes_fim
+      FROM generate_series(
+             (SELECT date_trunc('month', min(dia)) FROM tb_odometro_dia),
+             (SELECT date_trunc('month', max(dia)) FROM tb_odometro_dia),
+             INTERVAL '1 month') d
+), grade AS (
+    -- btrim na placa: a Geotab devolve licensePlate com espaco nas bordas em parte
+    -- da frota. O JOIN nao sofre (e por device_id), mas no Power BI "ABC1D23" e
+    -- "ABC1D23 " sao valores DISTINTOS -- duplicam no filtro e quebram relacionamento.
+    SELECT c.id, c.serial, btrim(c.placa) AS placa,
+           concat_ws(' | ', btrim(c.placa), marca_padrao(c.marca, c.modelo),
+                            modelo_padrao(c.marca, c.modelo)) AS veiculo,
+           arrumar_grupos(c.todos_grupos)                     AS todos_grupos,
+           c.todos_grupos_expandido,
+           hashtext(arrumar_grupos(c.todos_grupos))           AS grupo_id,
+           m.mes_ini, m.mes_fim
+      FROM tb_cadastro c CROSS JOIN meses m
+)
+SELECT g.id,
+       EXTRACT(year FROM g.mes_ini)::int, EXTRACT(month FROM g.mes_ini)::int,
+       to_char(g.mes_ini, 'YYYY-MM'), g.mes_ini, g.mes_fim,
+       g.serial, g.placa, g.veiculo, g.todos_grupos, g.todos_grupos_expandido, g.grupo_id,
+       COALESCE(ant.odometro, prim.odometro),
+       fim.odometro,
+       round((fim.odometro - COALESCE(ant.odometro, prim.odometro))::numeric, 1),
+       COALESCE(ant.dia, prim.dia), fim.dia, COALESCE(dias.qtd, 0),
+       CASE WHEN fim.odometro IS NULL    THEN 'sem leitura'
+            WHEN ant.odometro IS NOT NULL THEN 'fechamento do mes anterior'
+            ELSE 'primeira leitura do veiculo' END,
+       CASE WHEN fim.odometro IS NULL THEN 'sem leitura'
+            -- suspeita se QUALQUER das duas pontas do mes veio da carga legada:
+            -- um fechamento novo com abertura legada ainda produz km errado
+            WHEN fim.atualizado_em  < TIMESTAMP '2026-09-22 13:59'
+              OR ant.atualizado_em  < TIMESTAMP '2026-09-22 13:59'
+              OR prim.atualizado_em < TIMESTAMP '2026-09-22 13:59' THEN 'legado (unidade suspeita)'
+            ELSE 'carga corrigida' END,
+       now()
+  FROM grade g
+  LEFT JOIN LATERAL (
+       SELECT o.odometro, o.dia, o.atualizado_em FROM tb_odometro_dia o
+        WHERE o.device_id = g.id AND o.dia < g.mes_ini
+          AND o.odometro > 0 AND o.odometro < 3000000
+        ORDER BY o.dia DESC LIMIT 1) ant ON TRUE
+  LEFT JOIN LATERAL (
+       SELECT o.odometro, o.dia, o.atualizado_em FROM tb_odometro_dia o
+        WHERE o.device_id = g.id AND o.dia BETWEEN g.mes_ini AND g.mes_fim
+          AND o.odometro > 0 AND o.odometro < 3000000
+        ORDER BY o.dia ASC LIMIT 1) prim ON TRUE
+  LEFT JOIN LATERAL (
+       SELECT o.odometro, o.dia, o.atualizado_em FROM tb_odometro_dia o
+        WHERE o.device_id = g.id AND o.dia <= g.mes_fim
+          AND o.odometro > 0 AND o.odometro < 3000000
+        ORDER BY o.dia DESC LIMIT 1) fim ON TRUE
+  LEFT JOIN LATERAL (
+       SELECT count(*) AS qtd FROM tb_odometro_dia o
+        WHERE o.device_id = g.id AND o.dia BETWEEN g.mes_ini AND g.mes_fim
+          AND o.odometro > 0 AND o.odometro < 3000000) dias ON TRUE
+"""
+
+
+def recarregar_odometro_mensal(engine):
+    """Recalcula tb_odometro_mensal (hodometro por veiculo x mes) a partir de
+    tb_odometro_dia + tb_cadastro. TRUNCATE + INSERT: sao ~18k linhas e ~3 s,
+    nao compensa incremental — e assim um veiculo novo no cadastro ou uma
+    leitura corrigida entram sem tratamento especial.
+
+    Grade COMPLETA (cadastro CROSS JOIN meses): todo veiculo aparece em todo
+    mes, mesmo parado. A abertura do mes e a ULTIMA leitura ANTERIOR a ele
+    (carry-forward), nao a 1a do mes — so ha leitura em dia rodado, entao a 1a
+    do mes perderia km e os meses nao emendariam.
+
+    A guarda `odometro < 3000000` corta a sentinela 2^31/10 (overflow INT32)
+    que o device b12B emite. Ver migracao_odometro_mensal_2026-09-22.sql."""
+    def _exec():
+        with engine.begin() as conn:
+            conn.execute(text("TRUNCATE tb_odometro_mensal"))
+            conn.execute(text(SQL_ODOMETRO_MENSAL))
+            return conn.execute(text("SELECT count(*) FROM tb_odometro_mensal")).scalar()
+
+    n = _com_retry(_exec)
+    log.info(f"  ✓ tb_odometro_mensal: {n} linhas (veículo×mês) recalculadas.")
 
 
 # ─────────────────────────────────────────────────────────
@@ -1370,6 +1658,12 @@ def sincronizar_comportamento(credentials, engine):
     # backfill = mesma janela de 6 meses dos buckets; incremental = só os dias novos
     # (desde o último dia gravado). Não há mais reconstrução de tb_comportamento.
     sincronizar_odometro_dia(credentials, engine, lista_ids, desde, data_fim)
+
+    # ── Hodômetro por VEÍCULO × MÊS → tb_odometro_mensal (2026-09-22) ──
+    # Derivada 100% do que acabou de ser gravado acima + tb_cadastro; nenhuma
+    # chamada à Geotab. Recalculada por inteiro (~18k linhas, ~3 s).
+    recarregar_odometro_mensal(engine)
+
     log.info(f"  → comportamento sincronizado ({'backfill' if backfill else 'incremental'}).")
 
 
@@ -1823,6 +2117,140 @@ def sincronizar_viagens(credentials, engine):
     return total_gravadas
 
 
+# ─────────────────────────────────────────────────────────
+# TABELA — ABASTECIMENTO (FuelUpEvent)
+# ─────────────────────────────────────────────────────────
+# Margem de segurança do modo incremental: a Geotab REVISA eventos recentes (a
+# detecção depende de leituras de nível que chegam com atraso), então re-buscamos
+# alguns dias já gravados. O upsert por (device_id, data_hora) não duplica.
+ABASTECIMENTO_MARGEM_DIAS = int(os.environ.get("ABASTECIMENTO_MARGEM_DIAS", 3))
+
+# Tamanho do bloco de dias por chamada. O Get de FuelUpEvent é por JANELA (uma
+# chamada cobre a frota toda, ao contrário das viagens, que são por device), mas a
+# primeira carga cobre o ano inteiro (~53 mil eventos em 2026) — fatiar em blocos
+# mensais evita qualquer teto de resultados do servidor e limita o pico de memória.
+ABASTECIMENTO_LOTE_DIAS = int(os.environ.get("ABASTECIMENTO_LOTE_DIAS", 31))
+
+
+def _ultimo_abastecimento_gravado(engine):
+    """Maior data_hora já gravada em tb_abastecimento (ou None se vazia).
+    Base do modo incremental — a janela começa aqui menos a margem."""
+    try:
+        with engine.connect() as conn:
+            return conn.execute(text("SELECT max(data_hora) FROM tb_abastecimento")).scalar()
+    except Exception as e:
+        log.warning(f"  • Não consegui ler o último abastecimento gravado ({e}); "
+                    f"usando carga do ano.")
+        return None
+
+
+def _montar_abastecimento_row(ev):
+    """Converte um FuelUpEvent da API na linha de tb_abastecimento.
+    Retorna None se o evento não tem device/data (sem chave, não há o que gravar).
+
+    UNIDADES (verificadas contra tb_odometro_dia em 2026-08-31): `odometer` e
+    `distance` vêm em METROS — o odômetro da API bate com o do projeto na razão
+    ~1000. Convertidos p/ km aqui, para a tabela ficar na mesma unidade das viagens."""
+    did = (ev.get("device") or {}).get("id")
+    ts  = ts_brt(ev.get("dateTime"))
+    if not did or pd.isna(ts):
+        return None
+
+    # driver vem como dict {'id': ...} quando identificado e como a STRING
+    # 'UnknownDriverId' quando não — mesmo padrão dos eventos de comportamento.
+    drv = ev.get("driver")
+    drv_id = drv.get("id") if isinstance(drv, dict) else None
+
+    loc = ev.get("location") or {}
+    return {
+        "device_id":        did,
+        "data_hora":        ts,
+        "litros":           ev.get("volume"),
+        "litros_derivado":  ev.get("derivedVolume"),
+        "litros_motor":     ev.get("totalFuelUsed"),
+        "distancia_km":     (ev.get("distance") or 0) / 1000.0,
+        "odometro_km":      (ev.get("odometer") or 0) / 1000.0,
+        "tanque_litros":    (ev.get("tankCapacity") or {}).get("volume"),
+        # y = latitude, x = longitude (padrão da Geotab, igual ao reverse_geocode)
+        "latitude":         loc.get("y"),
+        "longitude":        loc.get("x"),
+        "motorista_id":     drv_id,
+        "tipo_combustivel": ev.get("productType"),
+        "confianca":        ev.get("confidence"),
+        "atualizado_em":    agora_brt(),
+    }
+
+
+def sincronizar_abastecimento(credentials, engine):
+    """Extrai os abastecimentos (FuelUpEvent) e grava em tb_abastecimento.
+
+    A Geotab deduz cada abastecimento pela subida do nível do tanque combinada com
+    a parada da viagem — é telemetria, NÃO extrato de cartão (FuelTransaction está
+    vazia nesta base, então não há valor em R$, posto nem nota fiscal).
+
+    Janela = ano corrente (piso DATA_CORTE), INCREMENTAL a partir do último evento
+    gravado menos ABASTECIMENTO_MARGEM_DIAS. Barato: o Get é por janela (uma chamada
+    cobre a frota inteira), fatiado em blocos de ABASTECIMENTO_LOTE_DIAS dias.
+    Retorna o total de eventos gravados."""
+    data_fim    = agora_brt()
+    data_inicio = data_fim.replace(month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
+    modo_janela = "ano corrente"
+
+    ultimo = _ultimo_abastecimento_gravado(engine)
+    if ultimo is not None:
+        desde = ultimo - timedelta(days=ABASTECIMENTO_MARGEM_DIAS)
+        if desde > data_inicio:
+            data_inicio = desde
+            modo_janela = (f"incremental (último {ultimo:%Y-%m-%d %H:%M} "
+                           f"− {ABASTECIMENTO_MARGEM_DIAS}d de margem)")
+
+    # Piso global: nunca antes de ANO_CORTE (mesma regra das outras tabelas).
+    if data_inicio < DATA_CORTE:
+        data_inicio = DATA_CORTE
+
+    log.info(f"Extraindo abastecimentos ({modo_janela}: "
+             f"{data_inicio:%Y-%m-%d} → {data_fim:%Y-%m-%d})...")
+
+    total = 0
+    bloco_ini = data_inicio
+    while bloco_ini < data_fim:
+        bloco_fim = min(bloco_ini + timedelta(days=ABASTECIMENTO_LOTE_DIAS), data_fim)
+        eventos = geotab_get(credentials, "FuelUpEvent", search={
+            "fromDate": bloco_ini.strftime(FMT),
+            "toDate":   bloco_fim.strftime(FMT),
+        })
+        linhas = [r for r in (_montar_abastecimento_row(e) for e in eventos) if r]
+        log.info(f"  • {bloco_ini:%Y-%m-%d} → {bloco_fim:%Y-%m-%d}: "
+                 f"{len(eventos)} eventos, {len(linhas)} válidos")
+        if linhas:
+            df = pd.DataFrame(linhas)
+            # Um device pode ter 2 eventos no MESMO segundo entre blocos vizinhos
+            # (a janela se sobrepõe em 1 instante); o DISTINCT ON do upsert resolve.
+            gravar_tabela(df, "tb_abastecimento", engine,
+                          chave_upsert="device_id, data_hora")
+            total += len(df)
+            del df, linhas, eventos
+            gc.collect()
+        bloco_ini = bloco_fim
+
+    # Piso temporal: o upsert nunca apaga, então eventos de anos anteriores que
+    # tenham entrado numa carga antiga sairiam só aqui (mesma regra dos buckets).
+    def _podar():
+        with engine.begin() as conn:
+            r = conn.execute(
+                text("DELETE FROM tb_abastecimento WHERE data_hora < CAST(:corte AS timestamp)"),
+                {"corte": DATA_CORTE},
+            )
+            return r.rowcount
+    apagados = _com_retry(_podar)
+    if apagados:
+        log.info(f"  ✓ {apagados} abastecimentos anteriores a "
+                 f"{DATA_CORTE:%Y-%m-%d} removidos.")
+
+    log.info(f"  → {total} abastecimentos gravados em tb_abastecimento")
+    return total
+
+
 def _upsert_resumo_mensal(engine, agg):
     """Grava/atualiza tb_resumo_mensal a partir de agg
     {(device_id, ano, mes): {'km', 'dur', 'dias'(set), 'viagens'}}."""
@@ -1939,12 +2367,64 @@ def atualizar_resumo_mes_corrente(engine):
 # ─────────────────────────────────────────────────────────
 # MAIN
 # ─────────────────────────────────────────────────────────
+def resolver_placas_duplicadas(engine, tabela):
+    """Grava o sufixo " -OFF" nas placas duplicadas de `tabela` (2026-09-24).
+
+    A mesma placa aparece em mais de um device_id quando o rastreador do veiculo
+    e trocado: o registro antigo fica com o historico e o novo segue rodando.
+    A REGRA vive na view `vw_placa_resolvida` (criada pelo views.sql) -- aqui so
+    aplicamos o resultado dela, para nao ter duas copias da logica.
+
+    POR QUE ISTO RODA A CADA SYNC: o upsert de tb_cadastro/tb_status traz a placa
+    crua da API e desfaz o sufixo. Sem este passo logo depois, a tabela volta a
+    ter duplicadas todo dia -- as VIEWS ficariam certas e a TABELA errada.
+
+    NAO-FATAL: banco novo ainda nao tem a view (o views.sql roda depois).
+    """
+    try:
+        with engine.begin() as conn:
+            n = conn.execute(text(f"""
+                WITH alvo AS MATERIALIZED (SELECT id, placa FROM vw_placa_resolvida)
+                UPDATE {tabela} t SET placa = a.placa
+                  FROM alvo a
+                 WHERE a.id = t.id AND t.placa IS DISTINCT FROM a.placa
+            """)).rowcount
+        if n:
+            log.info(f"  ✓ {tabela}: {n} placa(s) duplicada(s) marcada(s) com -OFF.")
+    except Exception as exc:
+        log.warning(f"  ! resolucao de placas em {tabela} falhou (nao-fatal): "
+                    f"{str(exc).strip()[:200]}")
+
+
+def atualizar_mv_comportamento(engine):
+    """Recalcula a mv_saneago_comportamento apos o sync dos eventos.
+
+    CONCURRENTLY nao bloqueia leitores: o Power BI e o exportar_csv.py seguem
+    lendo o retrato anterior enquanto o novo e construido. Exige o indice unico
+    em (id, data), criado pelo views.sql.
+
+    NAO-FATAL: banco recem-criado ainda nao tem a MV (o views.sql roda depois).
+    Falhar aqui nao pode desfazer o sync, que ja esta gravado.
+    """
+    t0 = time.time()
+    try:
+        with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
+            conn.execute(text("REFRESH MATERIALIZED VIEW CONCURRENTLY mv_saneago_comportamento"))
+        log.info(f"  ✓ mv_saneago_comportamento atualizada ({time.time() - t0:.0f}s).")
+    except Exception as exc:
+        log.warning("  ! REFRESH da mv_saneago_comportamento falhou (nao-fatal): "
+                    f"{str(exc).strip()[:200]}")
+
+
 def main(modo=None):
     if modo is None:
         modo = sys.argv[1] if len(sys.argv) > 1 else "all"
 
+    alvo = (f"{SUPABASE['usuario']}@{SUPABASE['host']}:{SUPABASE['porta']}"
+            f"/{SUPABASE['banco']}" + (f" [schema {SUPABASE['schema']}]" if SUPABASE["schema"] else ""))
     log.info(f"{'='*55}")
-    log.info(f"  Geotab → Supabase  |  modo: {modo}")
+    log.info(f"  Geotab → Postgres  |  modo: {modo}")
+    log.info(f"  DESTINO: {DESTINO.upper()}  →  {alvo}")
     log.info(f"{'='*55}")
 
     engine = criar_engine()
@@ -1957,6 +2437,8 @@ def main(modo=None):
         if modo in ("all", "cadastro"):
             df = extrair_cadastro(credentials)
             gravar_tabela(df, "tb_cadastro", engine, chave_upsert="id")
+            # logo apos o upsert: a API traz a placa crua e desfaz o sufixo
+            resolver_placas_duplicadas(engine, "tb_cadastro")
             del df
             gc.collect()
             # Dimensão de motoristas (lotação) — mesma fonte de grupos do cadastro.
@@ -1968,18 +2450,28 @@ def main(modo=None):
         if modo in ("all", "status"):
             df = extrair_status(credentials)
             gravar_tabela(df, "tb_status", engine, chave_upsert="id")
+            resolver_placas_duplicadas(engine, "tb_status")
             del df
             gc.collect()
 
         if modo in ("all", "comportamento"):
             sincronizar_comportamento(credentials, engine)
             gc.collect()
+            # A view de comportamento e materializada (custava 103s no local e
+            # NAO rodava no Cloud SQL). Quem a mantem fresca e este refresh.
+            atualizar_mv_comportamento(engine)
 
         # IMPORTANTE: viagens NÃO entra no 'all' — só roda no modo explícito.
         # É o trecho mais pesado (Trips por device + geocode) e travava o 'all'.
         # sincronizar_viagens já grava em lotes e libera memória a cada lote.
         if modo == "viagens":
             sincronizar_viagens(credentials, engine)
+
+        # Abastecimento entra no 'all': é BARATO (o Get é por janela, não por
+        # device — uma chamada por bloco mensal cobre a frota inteira).
+        if modo in ("all", "abastecimento"):
+            sincronizar_abastecimento(credentials, engine)
+            gc.collect()
 
     finally:
         engine.dispose()

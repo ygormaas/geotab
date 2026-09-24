@@ -2,7 +2,7 @@
 Rotina de atualização LOCAL (dispara no logon via Agendador de Tarefas do Windows).
 
 Por que local: o IP de saída do Render está bloqueado pelo WAF da Geotab (403);
-a máquina do usuário não está bloqueada. Roda os 4 modos do sync em sequência,
+a máquina do usuário não está bloqueada. Roda os 5 modos do sync em sequência,
 cada um isolado num subprocesso (uma falha não derruba os outros).
 
 Regras:
@@ -30,8 +30,9 @@ LOG    = BASE / "atualizacao_local.log"
 MARKER = BASE / ".ultima_atualizacao"          # guarda a data do último sucesso
 # Ordem leve → pesado. São as planilhas que mudam diariamente; cadastro/status são
 # snapshots rápidos, comportamento/viagens são incrementais (e atualizam, de quebra,
-# o odômetro/dia e o resumo mensal do mês corrente).
-MODOS  = ["cadastro", "status", "comportamento", "viagens"]
+# o odômetro/dia e o resumo mensal do mês corrente). `abastecimento` (FuelUpEvent)
+# fecha a fila: é incremental e barato (Get por janela, não por device).
+MODOS  = ["cadastro", "status", "comportamento", "viagens", "abastecimento"]
 NO_WINDOW = 0x08000000  # CREATE_NO_WINDOW: não pisca janela de console
 
 # ── Postgres local: auto-cura ────────────────────────────────────────────────

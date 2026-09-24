@@ -36,11 +36,24 @@ OUT = BASE / "exports"
 
 # ── Conexão Postgres local (mesmas chaves SUPABASE_* do resto do projeto) ──────
 PSQL = os.environ.get("PSQL", r"C:\Users\ygor.kouzak\pgsql\pgsql\bin\psql.exe")
-PGHOST = os.environ.get("SUPABASE_HOST", "127.0.0.1")
-PGPORT = os.environ.get("SUPABASE_PORTA", "5432")
-PGDB = os.environ.get("SUPABASE_BANCO", "geotab")
-PGUSER = os.environ.get("SUPABASE_USUARIO", "postgres")
-PGPASS = os.environ.get("SUPABASE_SENHA", "")
+# Destino da LEITURA, mesma chave do geotab_supabase.py:
+#   "local" (DEFAULT) -> chaves SUPABASE_*  (Postgres da maquina)
+#   "cloud"           -> chaves GCP_*       (Cloud SQL, schema geotab)
+# Este script NAO usa o criar_engine() -- chama o psql.exe direto -- entao sem
+# este seletor ele continuaria lendo o banco LOCAL depois da virada p/ a nuvem,
+# publicando CSV velho para os clientes externos sem erro nenhum.
+DESTINO = os.environ.get("GEOTAB_DESTINO", "local").strip().lower()
+if DESTINO not in ("local", "cloud"):
+    raise SystemExit("GEOTAB_DESTINO invalido: " + repr(DESTINO) + ". Use 'local' ou 'cloud'.")
+_PFX = "GCP_" if DESTINO == "cloud" else "SUPABASE_"
+
+PGHOST = os.environ.get(_PFX + "HOST", "127.0.0.1")
+PGPORT = os.environ.get(_PFX + "PORTA", "5432")
+PGDB = os.environ.get(_PFX + "BANCO", "geotab")
+PGUSER = os.environ.get(_PFX + "USUARIO", "postgres")
+PGPASS = os.environ.get(_PFX + "SENHA", "")
+PGSSL = os.environ.get(_PFX + "SSLMODE", "disable" if DESTINO == "local" else "require")
+PGSCHEMA = os.environ.get(_PFX + "SCHEMA", "").strip()
 
 # ── Supabase Storage ──────────────────────────────────────────────────────────
 STORAGE_URL = os.environ.get("SUPABASE_STORAGE_URL", "").rstrip("/")
@@ -74,7 +87,11 @@ ALVO_CSV = 180 * 1024 * 1024  # ~180 MB cru → ~36 MB gzip, bem abaixo do limit
 def _env_psql():
     # PGCLIENTENCODING=UTF8 é OBRIGATÓRIO: sem isso o psql assume WIN1252 do console
     # Windows e o \copy aborta no 1º acento (testado 2026-06-22).
-    return dict(os.environ, PGPASSWORD=PGPASS, PGCLIENTENCODING="UTF8")
+    env = dict(os.environ, PGPASSWORD=PGPASS, PGCLIENTENCODING="UTF8", PGSSLMODE=PGSSL)
+    if PGSCHEMA:
+        # o psql nao passa pelo criar_engine(); o schema alvo vai por aqui
+        env["PGOPTIONS"] = "-c search_path=" + PGSCHEMA
+    return env
 
 
 def _psql_query(sql):
