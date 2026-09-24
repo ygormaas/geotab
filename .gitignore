@@ -9,3 +9,8 @@ atualizacao_local.log
 __pycache__/
 # CSVs gerados p/ download externo (recriados a cada export)
 exports/
+# CSVs de diagnostico/levantamento (saidas de consulta, nao fonte).
+# Pasta PROPRIA, e nao dentro de exports/: o exportar_csv.py esvazia a
+# exports/ a cada execucao (unlink em tudo) e apagaria estes arquivos --
+# e uma subpasta la dentro quebraria o export, pois unlink falha em diretorio.
+diagnosticos/

@@ -1235,6 +1235,21 @@ passa a trazer sozinho.
 
 ---
 
+### Onde ficam os arquivos gerados (2026-09-24)
+
+| Pasta | Conteúdo | Versionada? |
+|---|---|---|
+| `exports/` | CSVs publicados para clientes externos, gerados pelo `exportar_csv.py` | não |
+| `diagnosticos/` | CSVs de levantamento pontual (validações, listas para correção de cadastro) | não |
+
+> **Nunca guarde nada em `exports/` que você queira conservar.** O `exportar_csv.py` **esvazia a
+> pasta inteira** no início de cada execução (`for f in OUT.glob("*"): f.unlink()`), e ela roda
+> todo dia útil. Pior: uma **subpasta** ali dentro faz o export **quebrar**, porque `unlink()`
+> falha em diretório. Foi por isso que os CSVs de diagnóstico ganharam pasta própria em vez de
+> irem para dentro da `exports/`.
+
+---
+
 ## 12. Decisões importantes (resumo)
 
 - **Local em vez de nuvem:** resolve IP bloqueado (WAF Geotab), limite de disco e custo.
