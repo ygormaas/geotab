@@ -1250,6 +1250,27 @@ passa a trazer sozinho.
 
 ---
 
+### Senha do Postgres local rotacionada (2026-09-24)
+
+A senha anterior estava **em texto claro** em `psql_geotab.bat` e `backup_geotab.bat`, que são
+versionados — ou seja, foi para o histórico do repositório. Duas correções:
+
+1. Os `.bat` passaram a **ler `SUPABASE_SENHA` do `.env`** em vez de embutir o valor.
+2. A senha foi **rotacionada**, o que torna o que ficou no histórico uma credencial morta.
+
+> Não reescrevemos o histórico do git. Seria custoso (muda o hash de todos os commits, exige
+> `push --force`, e o GitHub retém objetos antigos por um tempo) e desnecessário: depois da
+> rotação, o valor antigo não abre nada. O banco local também só escuta em `localhost`
+> (`listen_addresses = localhost`), então nunca esteve acessível de fora da máquina.
+
+**Onde a senha vive agora:** apenas no `.env` (não versionado). Tudo no projeto a lê de lá —
+sync, export, os dois `.bat` e os scripts de diagnóstico.
+
+**O que NÃO lê do `.env` e precisa de atualização manual ao rotacionar:** as conexões salvas do
+**Power BI** e do **DBeaver**, que guardam a credencial no próprio armazenamento.
+
+---
+
 ## 12. Decisões importantes (resumo)
 
 - **Local em vez de nuvem:** resolve IP bloqueado (WAF Geotab), limite de disco e custo.

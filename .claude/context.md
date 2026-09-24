@@ -668,6 +668,18 @@
 - Lista: `veiculos_sem_nivel_tanque_2026-09-23.csv`. km/L e litros NAO existem p/ esses 43 —
   nenhum ajuste de SQL resolve, o dado nao e coletado.
 
+## SENHA DO POSTGRES LOCAL ROTACIONADA (2026-09-24)
+- Motivo: estava em texto claro em psql_geotab.bat e backup_geotab.bat (VERSIONADOS) -> foi p/ o
+  historico do repo, que agora vive em github.com/ygormaas/geotab.
+- Feito: (1) os .bat passaram a ler SUPABASE_SENHA do .env; (2) senha rotacionada (28 chars
+  alfanumericos + _ -; sem % ^ & | < > p/ nao quebrar batch). Valor so no .env.
+- Verificado: senha ANTIGA recusada ("autenticacao do tipo senha falhou"); NOVA funciona em
+  criar_engine (sync), exportar_csv (psql) e nos .bat.
+- Historico do git NAO foi reescrito: custo alto (muda todos os hashes, exige push --force) e
+  desnecessario apos a rotacao. O banco local so escuta em localhost (listen_addresses=localhost),
+  nunca esteve acessivel de fora.
+- ⚠️ NAO leem do .env e precisam de atualizacao MANUAL: conexoes salvas do POWER BI e do DBEAVER.
+
 ## Última sessão
 - Data: 2026-09-22
 - Resumo: **HODÔMETRO POR VEÍCULO × MÊS** — pedido do usuário: ver o hodômetro de cada veículo no período filtrado, com TODOS os veículos da telemetria, id, placa/veículo, hodômetro inicial e final. 1ª entrega foram 2 VIEWS por cliente; o usuário pediu **"apague essas views, eu quero que seja uma tabela com todos os veículos"** → views DROPADAS e criada a TABELA única `tb_odometro_mensal` (`migracao_odometro_mensal_2026-09-22.sql`, APLICADA) sobre `tb_odometro_dia` + `tb_cadastro` cru. Três decisões de desenho: GRADE COMPLETA (cadastro CROSS JOIN meses, p/ o veículo parado não sumir do filtro); abertura por CARRY-FORWARD (última leitura ANTES do mês, não a 1ª do mês — só há leitura em dia rodado, então a 1ª do mês perderia km e os meses não emendariam); e mês sem leitura carrega a última conhecida (início=fim, km=0). O perfil do dado bruto revelou 3 sujeiras que viraram gotcha próprio (`odometro_gps` 100% zero, sentinela 2^31/10 no device b12B, odômetro não-monotônico em 363 devices). Perf medida com `LIMIT 200` ANTES (lição de 09/09): **0,07 s**. Ensaio em BEGIN/ROLLBACK; validações: meses emendam (0 desencontros/8.477 pares), km do odômetro 949.432 vs km de viagens 901.562 em set/26 (+5,3%, coerente — odômetro pega movimento fora de viagem). views.sql voltou ao original (1121 linhas). `geotab_supabase.py`: DDL da tabela + `recarregar_odometro_mensal` + chamada no fim do modo comportamento (testada de verdade: 3,6 s / 17.892 linhas). **Abrir p/ a frota inteira revelou 2 coisas que o filtro SANEAGO escondia**: (1) `todos_grupos` não tem o token `OPE_<cliente>` (zero veículos no LIKE) → tabela ganhou `todos_grupos_expandido`; (2) o **bug de unidade do odômetro** (gotcha próprio acima) — corrigido em 2 passos (÷1000 fixo → `DIVISOR_ODO_KM` por diagnóstico, porque o diag é escolhido em runtime e o 1º candidato já vem em km) + re-sync de 2026. **DEPOIS o usuário pediu 2025**: criado piso próprio `ODO_DATA_CORTE`/`ODO_DATA_INICIO` (gotcha próprio) e feito backfill de 15/abr→31/dez/2025 — tabela foi de 9 p/ **18 meses, 17.892 → 35.784 linhas**. Sobraram 76.756 linhas legadas em 2026 que a API não devolve mais; **o usuário optou por MANTER** (apagar custaria −13% de cobertura em 2026) → marcadas em `origem_dado`. Filtrando `origem_dado='carga corrigida'` restam 15.962 linhas com 1 km negativo e hodômetro máximo plausível (245.168 km). Pendente: apontar o Power BI p/ `tb_odometro_mensal`. NÃO commitado.
